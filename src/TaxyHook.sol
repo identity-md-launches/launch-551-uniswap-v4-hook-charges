@@ -36,7 +36,10 @@ contract TaxyHook is IHooks {
     error MissingSwap();
     error CallbackNotEnabled();
 
+    /// @notice Fee credited as native ETH or, alongside SwapFeeClaimMinted, as a native-ETH claim.
     event SwapFeePaid(PoolId indexed poolId, address indexed sender, bool zeroForOne, uint256 grossETH, uint256 feeETH);
+    /// @notice The fee was credited as a redeemable native-ETH claim instead of transferred.
+    event SwapFeeClaimMinted(PoolId indexed poolId, uint256 feeETH);
 
     constructor(IPoolManager manager) {
         if (address(manager).code.length == 0) revert InvalidPoolManager();
@@ -116,10 +119,17 @@ contract TaxyHook is IHooks {
         uint256 gross = params.zeroForOne ? uint256(-nativeDelta) + fee : uint256(nativeDelta);
         if (gross > MAX_AMOUNT) revert InvalidAmount();
 
-        // take creates an ETH debt for this hook. Its positive return delta cancels that exact debt.
-        // The manager transfers native ETH directly; there is no accrued balance or claim step.
+        // Both take and mint create the same ETH debt, canceled by the positive hook return delta.
+        // A buyer settles after swap returns, so an ETH-poor manager credits a native claim instead.
         emit SwapFeePaid(key.toId(), sender, params.zeroForOne, gross, fee);
-        if (fee != 0) poolManager.take(Currency.wrap(address(0)), FEE_RECIPIENT, fee);
+        if (fee != 0) {
+            if (address(poolManager).balance < fee) {
+                poolManager.mint(FEE_RECIPIENT, 0, fee);
+                emit SwapFeeClaimMinted(key.toId(), fee);
+            } else {
+                poolManager.take(Currency.wrap(address(0)), FEE_RECIPIENT, fee);
+            }
+        }
         swapping = false;
         return (IHooks.afterSwap.selector, specified ? int128(0) : fee.toInt128());
     }

@@ -1,7 +1,10 @@
 # taxy / t4
 
-An immutable Uniswap v4 hook that sends a **4% native-ETH swap fee** to
+An immutable Uniswap v4 hook that charges a **4% native-ETH swap fee** for
 `0x047F606fD5b2BaA5f5C6c4aB8958E45CB6B054B7` during each successful swap.
+The fee is transferred immediately when the PoolManager holds enough ETH;
+otherwise the recipient receives a native-ETH ERC-6909 claim during the swap,
+redeemable 1:1 through the same manager after settlement.
 The accompanying ERC-20 is named **taxy**, symbol **t4**, with 18 decimals and
 exactly **1,000,000,000 tokens** (`10^27` minor units). Its no-argument constructor
 mints the entire supply to its deployer, normally the launch factory.
@@ -31,7 +34,8 @@ Token transfers are ordinary ERC-20 transfers; the fee belongs to the hook.
 
 All arithmetic is in wei. Let **G** be the total ETH paid by a buyer, or the gross
 ETH output from the AMM before this hook's fee on a sale. The fee is always
-`F = floor(G * 400 / 10_000) = floor(G / 25)`. The recipient receives F immediately.
+`F = floor(G * 400 / 10_000) = floor(G / 25)`. The recipient receives F immediately
+as ETH or, if the manager's native balance is below F, as a native-ETH claim.
 Rounding can produce a zero fee when G is below 25 wei.
 
 | Swap request | AMM native amount | Fee | Trader native amount |
@@ -65,10 +69,15 @@ pool cannot initialize successfully while the hook address has no code.
 
 `beforeSwap` reserves a positive specified delta only when ETH is specified.
 `afterSwap` checks the fill and charges an unspecified delta when ETH is
-unspecified. It calls `poolManager.take(native, recipient, F)` directly. The
-resulting hook debt of F is canceled by the positive hook return delta of F;
-the swapper's native delta accounts for the fee. No ERC-20 is taken as a fee,
-no ETH is retained by the hook, and no later claiming or upkeep is needed.
+unspecified. It calls `poolManager.take(native, recipient, F)` when the manager
+has at least F wei. Otherwise it calls `poolManager.mint(recipient, 0, F)`,
+crediting the recipient with ERC-6909 claims for native ETH (currency ID `0`).
+Both operations create the same hook debt of F, canceled by the positive hook
+return delta of F; the swapper's native delta accounts for the fee. No ERC-20
+is taken as a fee and no ETH or claim is retained by the hook. The manager's
+unlock requires all debts to settle, so an unfunded swap rolls back the claim
+and the trade together. Claims are liabilities against the manager's ETH,
+not additional ETH when calculating conservation of funds.
 
 Only the constructor-supplied manager can call callbacks. A guard spans both swap
 callbacks and remains active during ETH delivery, preventing nested swaps through
@@ -115,7 +124,7 @@ v4-core's IHooks interface, with no share token or administration:
 
 `access: none` records the brief's immutable design, outside the reference
 Wizard's administrative choices. No CurrencySettler helper is needed because
-the hook only calls native `take`; routers settle the trader's debts. The hook
+the hook only calls native `take` or `mint`; routers settle the trader's debts. The hook
 guard uses ordinary storage; v4-core itself requires transient storage.
 
 ## Build and check offline
@@ -137,6 +146,8 @@ Tests deploy a real v4 PoolManager, mine and deploy the actual hook with CREATE2
 initialize pools, add/remove liquidity, and settle swaps. They cover both swap
 directions and amount modes, fee conservation, partial fills, rounding, unauthorized
 callbacks, recipient failures and reentrancy, fixed supply, and fuzzed amounts.
+Shortfall regressions cover token-only seed liquidity, both buy modes, the
+payment threshold, claim redemption and authorization, and rollback on failure.
 `test/helpers/` contains testing tools rather than production routers.
 
 ## Deployment parameters and responsibilities
@@ -180,20 +191,39 @@ The deployer must:
    predicted hook address.
 5. Rehearse against the actual manager/router on a fork, independently review
    the contracts, and verify deployed source and address flags. Check fee
-   recipient delivery on the target chain. The helper only mines; it does not
+   recipient delivery and native-claim redemption on the target chain. The helper only mines; it does not
    deploy, initialize, seed, or distribute funds.
 
 Routers must account for hook-adjusted deltas, enforce minimum net output / maximum
 total input and deadlines, and settle all manager credits and debts within unlock.
-The fee is delivered before the ordinary post-swap input settlement. PoolManager
-must therefore already hold enough native ETH for that payment. A router can
-pre-settle native credit within unlock when reserves are insufficient; otherwise
-the swap safely reverts. The test router demonstrates ordinary settlement only.
+The hook credits the fee before the ordinary post-swap input settlement. A
+fresh manager with token-only seed liquidity can therefore execute buys without
+unrelated pools' ETH: the fee becomes a native claim and the buyer's settlement
+funds the manager. Router pre-settlement can avoid the claim path but is not
+required. If the manager has enough ETH, the original direct-payment path applies.
 
-There are **no keepers, administrators or fee-claim operations**. Monitor
-`SwapFeePaid(poolId, sender, zeroForOne, grossETH, feeETH)` and failed swaps; sender
-is the manager's caller (usually a router), not an authenticated end user. A
-recipient that rejects ETH makes fee-bearing swaps revert atomically. Nobody can
+There are **no keepers or administrators**. Monitor
+`SwapFeePaid(poolId, sender, zeroForOne, grossETH, feeETH)` for fees credited by
+either path and `SwapFeeClaimMinted(poolId, feeETH)` for the subset credited as
+claims; do not count both events as separate fees. Sender is the manager's
+caller (usually a router), not an authenticated end user.
+
+The recipient is responsible for redeeming any claims. Query
+`poolManager.balanceOf(recipient, 0)`. A reviewed redemption router must, within
+`unlock`, call `burn(recipient, 0, amount)` followed by
+`take(Currency.wrap(address(0)), recipient, amount)`. An EOA recipient first grants
+that router an amount-specific ERC-6909 allowance using the manager's
+`approve(router, 0, amount)`; this is separate from t4 ERC-20 approvals. The router
+must authenticate redemption requests and prevent payout redirection. Burning
+cancels the claim and creates the credit consumed by `take`, returning accounting
+to zero. Tests demonstrate redemption after swap settlement, unauthorized burns,
+and rollback; their helper is not a production router. Claims are not automatically
+redeemed on later swaps, and the hook cannot redeem or redirect them.
+
+A recipient that rejects ETH still makes swaps using the direct-payment path
+revert atomically; the fallback handles insufficient manager ETH, not recipient
+rejection. Keep the recipient a plain EOA or payable contract and rehearse
+redemption before launch. Liquidity exit remains available. Nobody can
 redirect the fee or rescue accidentally sent assets. No contract was deployed to
 a public chain by this assignment. See [the security review](docs/SECURITY_REVIEW.md)
 for review scope and outstanding release checks.
