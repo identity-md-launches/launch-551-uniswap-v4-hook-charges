@@ -15,6 +15,18 @@ These suites extend the existing tests without changing the implementation or bu
 - `TaxyHookPresettlement.t.sol` seeds a real pool entirely with tokens and no native reserves.
   Prepaid buys must deliver the 4% fee during the swap, return unused ETH credit, and clear all
   manager deltas. Empty pools execute no token-specified exchange and retain no swap fee.
+- `TaxyClaimFallback.t.sol` targets the native-claim fallback added after the manager-balance
+  shortfall finding. A token-only launch pool on the real PoolManager starts with no ETH, so random
+  sequences of buys, sells, recipient redemptions and LP changes move the manager's balance across
+  the fee and alternate between direct ETH payment and ERC-6909 claim minting. The handler predicts
+  the branch from the balance before each call, records only observed payments, and tolerates
+  exactly two refusals: the hook's own `PartialFillNotSupported` for an unfillable exact-ETH-output
+  sell and the pool's price-limit refusal once it holds no ETH. Invariants: every fee is paid once as
+  ETH or as a claim, only the recipient ever holds native claims, manager ETH always covers the
+  outstanding claims, and after every LP exits the recipient can redeem everything and ends with
+  exactly 4% of every gross amount. Unit tests pin zero-fee buys at zero ETH, both events on the
+  claim branch, direct payment drawn from claim backing and its rollback when the buyer cannot
+  settle, third-party claim transfer/burn refusal, and a near-complete drain of the pool.
 - `TaxyTokenEdges.t.sol` pins zero, one wei, full supply, maximum uint, self transfers, allowance
   exhaustion/revocation, and failed delegated transfers. Split-transfer fuzzing checks no token tax.
 - `TaxyTokenInvariant.t.sol` tracks independent balances and allowances for four actors through
